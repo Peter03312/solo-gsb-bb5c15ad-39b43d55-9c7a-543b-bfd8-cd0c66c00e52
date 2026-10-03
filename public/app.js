@@ -43,7 +43,9 @@ async function api(path, opts = {}) {
     });
   } catch (e) {
     connEl.textContent = '连接失败';
-    throw new Error('无法连接服务器');
+    const err = new Error('无法连接服务器');
+    err.network = true; // 网络中断：未收到任何响应，同一意图重送须沿用请求编号
+    throw err;
   }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
@@ -54,6 +56,54 @@ async function api(path, opts = {}) {
   }
   connEl.textContent = '';
   return data;
+}
+
+/* ---------- 请求编号幂等：网络中断后重送同一意图沿用同一编号 ----------
+ * 每次点击写操作生成一个请求编号（request_id）随请求提交；若因网络中断未收到响应，
+ * 同一意图（同一操作目标 + 相同输入）再次提交时沿用首次编号，服务端据此去重并返回首次结果，
+ * 不会产生重复流水 / 接续演出 / 封场报告。收到明确响应（成功或业务拒绝）后编号失效，
+ * 下一次点击生成新编号；输入内容变化（如改了原因、清单）也视为新意图、生成新编号。 */
+const intentRequests = new Map(); // intentKey -> { requestId, payloadJson }
+
+function newRequestId() {
+  return `r${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function stablePayloadJson(v) {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v);
+  if (Array.isArray(v)) return `[${v.map(stablePayloadJson).join(',')}]`;
+  return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${stablePayloadJson(v[k])}`).join(',')}}`;
+}
+
+/** 带请求编号执行一次写操作：同一意图沿用旧编号；网络错误保留编号供重送，其余响应清除编号 */
+async function apiIntent(perfId, intentKey, payload, path) {
+  const key = `${perfId}:${intentKey}`;
+  const payloadJson = stablePayloadJson(payload);
+  const hit = intentRequests.get(key);
+  let requestId;
+  if (hit && hit.payloadJson === payloadJson) {
+    requestId = hit.requestId; // 同一意图重送：沿用首次编号
+  } else {
+    requestId = newRequestId();
+    intentRequests.set(key, { requestId, payloadJson });
+  }
+  try {
+    const r = await api(path, { method: 'POST', body: { ...payload, request_id: requestId } });
+    intentRequests.delete(key); // 成功：意图完成，下次点击生成新编号
+    return r;
+  } catch (e) {
+    if (!e.network) intentRequests.delete(key); // 业务拒绝（4xx）：已获明确响应，下次点击生成新编号
+    throw e; // 网络错误：保留编号，同一意图重送时沿用
+  }
+}
+
+/** 重放提示：服务端去重返回首次结果时给出说明；返回是否为重放 */
+function replayToast(r) {
+  if (r && r.idempotent_replay) {
+    toast('网络重送已去重：返回首次提交的结果（未重复执行）');
+    return true;
+  }
+  return false;
 }
 
 function stopPolling() {
@@ -896,11 +946,10 @@ async function doHandoverSubmit(perfId) {
   if (!receivedBy) return toast('请填写接班人', true);
   if (handedBy === receivedBy) return toast('交班人与接班人不能为同一人', true);
   try {
-    const r = await api(`/api/performances/${perfId}/handover`, {
-      method: 'POST', body: { handed_by: handedBy, received_by: receivedBy, note },
-    });
+    const r = await apiIntent(perfId, 'handover-submit', { handed_by: handedBy, received_by: receivedBy, note },
+      `/api/performances/${perfId}/handover`);
     st.signBy = '';
-    toast(`交接单 #${r.handover.id} 已生成，等待接班人 ${receivedBy} 签收`);
+    if (!replayToast(r)) toast(`交接单 #${r.handover.id} 已生成，等待接班人 ${receivedBy} 签收`);
   } catch (e) { return toast(e.message, true); }
   stopPolling();
   renderPerformance(perfId);
@@ -914,11 +963,10 @@ async function doHandoverResubmit(perfId, handover) {
   const note = window.prompt('交接说明（可修改，留空则清空）：', handover.note || '') ;
   if (note == null) return;
   try {
-    const r = await api(`/api/performances/${perfId}/handover`, {
-      method: 'POST',
-      body: { handed_by: handedBy.trim(), received_by: handover.received_by, note: note.trim() },
-    });
-    toast(`已由交班人重提，旧单作废、新单 #${r.handover.id} 等待签收`);
+    const r = await apiIntent(perfId, 'handover-submit',
+      { handed_by: handedBy.trim(), received_by: handover.received_by, note: note.trim() },
+      `/api/performances/${perfId}/handover`);
+    if (!replayToast(r)) toast(`已由交班人重提，旧单作废、新单 #${r.handover.id} 等待签收`);
   } catch (e) { return toast(e.message, true); }
   stopPolling();
   renderPerformance(perfId);
@@ -930,11 +978,10 @@ async function doHandoverSign(perfId) {
   st.signBy = operator;
   if (!operator) return toast('请填写签收人（接班人本人）', true);
   try {
-    const r = await api(`/api/performances/${perfId}/handover/sign`, {
-      method: 'POST', body: { operator },
-    });
+    const r = await apiIntent(perfId, 'handover-sign', { operator },
+      `/api/performances/${perfId}/handover/sign`);
     st.signBy = '';
-    toast(`交接单 #${r.handover.id} 已签收，交接完成`);
+    if (!replayToast(r)) toast(`交接单 #${r.handover.id} 已签收，交接完成`);
   } catch (e) {
     if (e.data && e.data.groups) toast(`核对未通过：${e.data.diff_count} 项差异，见交接面板`, true);
     else toast(e.message, true);
@@ -1165,8 +1212,9 @@ async function doClosingRun(perfId) {
   if (!note) return toast('请填写封场说明', true);
   if (!window.confirm('确认封场？封场判定将与现场写操作串行执行；通过后该演出即转为终态只读，全部写操作（含重复封场）都会被拒绝，原记录与不可变报告可回看。')) return;
   try {
-    await api(`/api/performances/${perfId}/closeout`, { method: 'POST', body: { closed_by: closedBy, note } });
-    toast('已封场结项，不可变报告已生成');
+    const r = await apiIntent(perfId, 'closeout', { closed_by: closedBy, note },
+      `/api/performances/${perfId}/closeout`);
+    if (!replayToast(r)) toast('已封场结项，不可变报告已生成');
     st.check = null;
   } catch (e) {
     if (e.data && e.data.blockers) {
@@ -1372,13 +1420,12 @@ async function doBatchSubmit(perfId, cues) {
   if (!window.confirm(`成组 ${pv.success_count} 项预览均通过。确认按顺序整组提交？\n（提交瞬间按最新状态重新判定，任一项失败则整组不产生流水）`)) return;
 
   try {
-    const r = await api(`/api/performances/${perfId}/batch`, {
-      method: 'POST',
-      body: { operator, items: st.rows.map(row2 => ({ label: row2.label, action: row2.action, reason: row2.reason })) },
-    });
+    const r = await apiIntent(perfId, 'batch',
+      { operator, items: st.rows.map(row2 => ({ label: row2.label, action: row2.action, reason: row2.reason })) },
+      `/api/performances/${perfId}/batch`);
     st.rows = [emptyBatchRow()];
     st.preview = null;
-    toast(`成组提交成功：已依次写入 ${r.success_count} 条执行流水`);
+    if (!replayToast(r)) toast(`成组提交成功：已依次写入 ${r.success_count} 条执行流水`);
   } catch (e) {
     // 服务端事务内重新判定发现失败：整组未生效、无流水；用返回的逐项结果替换预览
     if (e.data && Array.isArray(e.data.results)) {
@@ -1500,11 +1547,10 @@ async function doRegisterFaultSubmit(perfId, label, rawReason, cueByLabel) {
   const cue = cueByLabel.get(label);
   if (!cue) return toast(`编号「${label}」不属于当前演出的执行单`, true);
   try {
-    const r = await api(`/api/performances/${perfId}/cues/${cue.id}/faults`, {
-      method: 'POST', body: { operator, reason: rawReason },
-    });
+    const r = await apiIntent(perfId, `fault-register:${cue.id}`, { operator, reason: rawReason },
+      `/api/performances/${perfId}/cues/${cue.id}/faults`);
     getFaultState(perfId).label = '';
-    toast(`已登记「${r.fault.label}」故障，冻结 ${r.fault.affected_labels.length} 个提示的触发`);
+    if (!replayToast(r)) toast(`已登记「${r.fault.label}」故障，冻结 ${r.fault.affected_labels.length} 个提示的触发`);
   } catch (e) { toast(e.message, true); }
   stopPolling();
   renderPerformance(perfId);
@@ -1521,10 +1567,9 @@ async function doRegisterFault(perfId, label) {
   const cue = st.cues.find(c => c.label === label);
   if (!cue) return toast(`编号「${label}」不属于当前演出的执行单`, true);
   try {
-    const r = await api(`/api/performances/${perfId}/cues/${cue.id}/faults`, {
-      method: 'POST', body: { operator, reason: reason.trim() },
-    });
-    toast(`已登记「${r.fault.label}」故障，冻结 ${r.fault.affected_labels.length} 个提示的触发`);
+    const r = await apiIntent(perfId, `fault-register:${cue.id}`, { operator, reason: reason.trim() },
+      `/api/performances/${perfId}/cues/${cue.id}/faults`);
+    if (!replayToast(r)) toast(`已登记「${r.fault.label}」故障，冻结 ${r.fault.affected_labels.length} 个提示的触发`);
   } catch (e) { toast(e.message, true); }
   stopPolling();
   renderPerformance(perfId);
@@ -1537,10 +1582,9 @@ async function doResolveFault(perfId, faultId) {
   if (reason == null) return;
   if (!reason.trim()) return toast('解除故障必须填写原因', true);
   try {
-    await api(`/api/performances/${perfId}/faults/${faultId}/resolve`, {
-      method: 'POST', body: { operator, reason: reason.trim() },
-    });
-    toast('故障已解除，提示状态已按当前有效结果重算');
+    const r = await apiIntent(perfId, `fault-resolve:${faultId}`, { operator, reason: reason.trim() },
+      `/api/performances/${perfId}/faults/${faultId}/resolve`);
+    if (!replayToast(r)) toast('故障已解除，提示状态已按当前有效结果重算');
   } catch (e) { toast(e.message, true); }
   stopPolling();
   renderPerformance(perfId);
@@ -1633,10 +1677,11 @@ async function doIssuePrep(perfId, cueId, label) {
   const issuedBy = getOperator();
   if (!issuedBy) { toast('请先填写发令人（顶部操作人输入框，填舞台监督姓名）', true); return document.getElementById('operator-input').focus(); }
   try {
-    const r = await api(`/api/performances/${perfId}/cues/${cueId}/prep-commands`, {
-      method: 'POST', body: { issued_by: issuedBy },
-    });
-    toast(r.superseded_command_id ? `已重新发出「${label}」预备口令，旧口令已作废（待另一操作人确认）` : `已发出「${label}」预备口令，等待另一操作人确认就绪`);
+    const r = await apiIntent(perfId, `prep-issue:${cueId}`, { issued_by: issuedBy },
+      `/api/performances/${perfId}/cues/${cueId}/prep-commands`);
+    if (!replayToast(r)) {
+      toast(r.superseded_command_id ? `已重新发出「${label}」预备口令，旧口令已作废（待另一操作人确认）` : `已发出「${label}」预备口令，等待另一操作人确认就绪`);
+    }
   } catch (e) { toast(e.message, true); }
   stopPolling();
   renderPerformance(perfId);
@@ -1646,10 +1691,9 @@ async function doConfirmPrep(perfId, cmdId) {
   const operator = getOperator();
   if (!operator) { toast('请先填写确认操作人（须与发令人不同）', true); return document.getElementById('operator-input').focus(); }
   try {
-    await api(`/api/performances/${perfId}/prep-commands/${cmdId}/confirm`, {
-      method: 'POST', body: { operator },
-    });
-    toast('已确认就绪，该提示现在可以触发');
+    const r = await apiIntent(perfId, `prep-confirm:${cmdId}`, { operator },
+      `/api/performances/${perfId}/prep-commands/${cmdId}/confirm`);
+    if (!replayToast(r)) toast('已确认就绪，该提示现在可以触发');
   } catch (e) { toast(e.message, true); }
   stopPolling();
   renderPerformance(perfId);
@@ -1818,11 +1862,10 @@ async function doContinueRun(perfId) {
 
   if (!window.confirm('确认生成接续演出？原演出将立即转为只读（保留原快照）。')) return;
   try {
-    const r = await api(`/api/performances/${perfId}/continue`, {
-      method: 'POST', body: { version_id: versionId, name, operator },
-    });
+    const r = await apiIntent(perfId, 'continue', { version_id: versionId, name, operator },
+      `/api/performances/${perfId}/continue`);
     continueUiState.delete(r.performance.id);
-    toast(`已生成接续演出 #${r.performance.id}，继承 ${r.carried_count} 条有效结果`);
+    if (!replayToast(r)) toast(`已生成接续演出 #${r.performance.id}，继承 ${r.carried_count} 条有效结果`);
     location.hash = `#/performances/${r.performance.id}`;
   } catch (e) {
     // 事务内串行判定发现冲突：刷新核对结果，原演出未改变
@@ -1938,8 +1981,9 @@ async function doFire(perfId, cueId) {
   const operator = getOperator();
   if (!operator) { toast('请先填写操作人', true); return document.getElementById('operator-input').focus(); }
   try {
-    const r = await api(`/api/performances/${perfId}/cues/${cueId}/fire`, { method: 'POST', body: { operator } });
-    if (r.request) toast('已提交触发申请，待另一操作人复核确认');
+    const r = await apiIntent(perfId, `fire:${cueId}`, { operator },
+      `/api/performances/${perfId}/cues/${cueId}/fire`);
+    if (!replayToast(r) && r.request) toast('已提交触发申请，待另一操作人复核确认');
   } catch (e) {
     toast(e.message, true); // 409 冲突 / 422 受阻等，消息含当前状态
   }
@@ -1954,9 +1998,9 @@ async function doSkip(perfId, cueId) {
   if (reason == null) return;
   if (!reason.trim()) return toast('跳过必须填写原因', true);
   try {
-    await api(`/api/performances/${perfId}/cues/${cueId}/skip`, {
-      method: 'POST', body: { operator, reason: reason.trim() },
-    });
+    const r = await apiIntent(perfId, `skip:${cueId}`, { operator, reason: reason.trim() },
+      `/api/performances/${perfId}/cues/${cueId}/skip`);
+    replayToast(r);
   } catch (e) {
     toast(e.message, true);
   }
@@ -1971,10 +2015,9 @@ async function doRetract(perfId, cueId) {
   if (reason == null) return;
   if (!reason.trim()) return toast('撤回必须填写原因', true);
   try {
-    await api(`/api/performances/${perfId}/cues/${cueId}/retract`, {
-      method: 'POST', body: { operator, reason: reason.trim() },
-    });
-    toast('已撤回，该提示可重新执行');
+    const r = await apiIntent(perfId, `retract:${cueId}`, { operator, reason: reason.trim() },
+      `/api/performances/${perfId}/cues/${cueId}/retract`);
+    if (!replayToast(r)) toast('已撤回，该提示可重新执行');
   } catch (e) {
     // 409：当前状态不允许撤回，或下游仍有已触发提示（消息含受影响编号）
     toast(e.message, true);
@@ -1989,10 +2032,9 @@ async function doConfirmRequest(perfId, reqId) {
   const operator = getOperator();
   if (!operator) { toast('请先填写操作人（须与申请人不同）', true); return document.getElementById('operator-input').focus(); }
   try {
-    await api(`/api/performances/${perfId}/review-requests/${reqId}/confirm`, {
-      method: 'POST', body: { operator },
-    });
-    toast('已确认，提示触发成功');
+    const r = await apiIntent(perfId, `review-confirm:${reqId}`, { operator },
+      `/api/performances/${perfId}/review-requests/${reqId}/confirm`);
+    if (!replayToast(r)) toast('已确认，提示触发成功');
   } catch (e) {
     // 409：申请已处置 / 确认人与申请人相同；422：前置未触发（申请保持待复核）
     toast(e.message, true);
@@ -2008,10 +2050,9 @@ async function doRejectRequest(perfId, reqId) {
   if (reason == null) return;
   if (!reason.trim()) return toast('驳回必须填写原因', true);
   try {
-    await api(`/api/performances/${perfId}/review-requests/${reqId}/reject`, {
-      method: 'POST', body: { operator, reason: reason.trim() },
-    });
-    toast('已驳回该申请');
+    const r = await apiIntent(perfId, `review-reject:${reqId}`, { operator, reason: reason.trim() },
+      `/api/performances/${perfId}/review-requests/${reqId}/reject`);
+    if (!replayToast(r)) toast('已驳回该申请');
   } catch (e) {
     toast(e.message, true);
   }
@@ -2023,10 +2064,9 @@ async function doCancelRequest(perfId, reqId) {
   const operator = getOperator();
   if (!operator) { toast('请先填写操作人（须为申请人本人）', true); return document.getElementById('operator-input').focus(); }
   try {
-    await api(`/api/performances/${perfId}/review-requests/${reqId}/cancel`, {
-      method: 'POST', body: { operator },
-    });
-    toast('已撤销该申请');
+    const r = await apiIntent(perfId, `review-cancel:${reqId}`, { operator },
+      `/api/performances/${perfId}/review-requests/${reqId}/cancel`);
+    if (!replayToast(r)) toast('已撤销该申请');
   } catch (e) {
     // 409：非申请人本人 / 申请已处置
     toast(e.message, true);

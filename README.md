@@ -22,6 +22,7 @@
 - **演出封场结项（封场报告）**：演出结束时舞台监督在**当前可操作演出**填写非空**结项人**与**封场说明**执行封场。封场前按当前演出版本**逐条核对提示**：每条都须有有效「已触发 / 已跳过」结果；同时**待复核申请、未解除故障、待签收交接单**均须处理完。若有阻项，按编号列出未完成提示（附阻塞原因）并分类列出其他阻项，返回 422——**演出保持可操作且不生成报告**。核对通过后在同一写事务内**一次性固定**结项时间、结项人与**不可变封场报告**：每条提示的最终结果及**原操作人、时间、流水与来源演出**；承接（carried）结果沿接续链**追溯原流水**（给出原演出 / 原流水与完整追溯链，沿用原操作人与时间，**不算本场再次触发**）。**已接续的只读演出不能封场**（只能封当前可操作的接续演出）；封场后原记录与不可变报告永久可回看，该演出的**单项与成组处置、复核、故障、交接及接续写操作全部拒绝，重复封场也拒绝**（统一 409）。封场判定与现场写操作在同一 `BEGIN IMMEDIATE` 事务内串行，未通过则整体回滚，不会留下部分结项。执行台与 HTTP API 均可查看封场报告
 - **提示计划节奏（计划秒数与容许偏差）**：排演时为草稿提示填写**相对开演的计划秒数**与**容许偏差秒数**（均为非负整数，计划秒数按提示顺序不递减；两列留空即不参与节奏统计），发布后随版本锁定，旧版未设置计划的提示不参与统计。每场演出以**原演出启动时间**为计时起点，执行台按当前有效结果展示有计划提示的**提前 / 准时 / 逾时 / 跳过**及**偏差秒数**（触发落在计划±容差内算准时，跳过不计偏差），未执行而超过计划上限的提示显示**逾时待执行**；撤回使原触发退出当前统计、重触发按新流水重算，历史流水仍可回看。**接续沿用原演出计时起点**，承接触发按原操作时间计算，未执行提示按新版计划判断，接续核对阻止已留痕编号的计划参数改变。**封场报告固定最终分类与汇总**，历史回看不随草稿或后续版本变化
 - **明确错误**：无已发布版本、非法依赖、前置未满足、缺少操作人 / 原因等均有中文错误提示
+- **请求编号幂等（断网重送去重）**：现场网络中断后，操作端可为同一演出的一次写操作附带请求编号（`request_id`），覆盖提示触发 / 跳过 / 撤回、复核与预备口令处置、故障登记与解除、成组提交、交接提交与签收、接续及封场。同一编号携带相同操作和输入重送时返回首次成功的业务结果，不再产生流水、接续演出或封场报告（即使演出随后已只读或封场也如此）；同一编号被不同操作或输入复用报 409 冲突且不改数据；校验失败不占号，重试按最新现场状态判定；并发重送只提交一次，编号记录与业务变更同事务同成败；未附编号的调用行为与返回字段保持兼容
 
 ## 一键启动（Docker Compose）
 
@@ -50,6 +51,8 @@ docker compose up --build
 ```bash
 npm start          # 或 node server.js
 # 打开 http://localhost:3000
+
+npm test           # 端到端测试：请求编号幂等全场景（自动起独立服务与临时库，不影响现有数据）
 ```
 
 ## 使用流程
@@ -76,10 +79,11 @@ npm start          # 或 node server.js
 
 ```
 server.js            # HTTP 入口：API 分发、静态文件、统一错误处理
-src/db.js            # SQLite 连接、建表初始化、事务包装、演示数据
+src/db.js            # SQLite 连接、建表初始化、事务包装（含嵌套 SAVEPOINT）、演示数据
 src/validate.js      # 执行单校验：缺失引用 / 重复编号 / 自依赖 / 循环依赖
-src/api.js           # 全部 REST 接口与业务规则
+src/api.js           # 全部 REST 接口与业务规则（含请求编号幂等去重）
 public/              # 前端单页应用（index.html / app.js / style.css）
+test/                # 端到端测试（npm test：请求编号幂等全场景）
 Dockerfile           # node:24-slim，零依赖构建
 docker-compose.yml   # 一键启动 + 数据卷
 ```
@@ -119,6 +123,8 @@ docker-compose.yml   # 一键启动 + 数据卷
 | POST | `/api/performances/:id/review-requests/:reqId/reject` | 驳回申请（缺原因 400；申请人请走撤销 409；已处置 409；只读演出 409） |
 | POST | `/api/performances/:id/cues/:cueId/prep-commands` | **发出预备口令**（body：`issued_by` 发令的舞台监督姓名，也兼容 `operator`；缺姓名 400）：仅需预备且无有效结果的提示可发，非需预备提示 400；只读 / 封场演出 409；提示已有有效结果 409。同一提示同时至多一条活动口令：重新发出时旧活动口令置 `superseded`（作废留痕）并返回 `superseded_command_id`。口令不是触发、不产生流水。返回 `{command, superseded_command_id}` |
 | POST | `/api/performances/:id/prep-commands/:cmdId/confirm` | **确认预备口令就绪**（body：`operator` 确认操作人，也兼容 `confirmed_by`；缺姓名 400）：确认人须与发令人不同（409）；口令已处置 409；确认瞬间重查——提示无有效结果、前置当前均已有效触发（固定各前置 fired 流水 id 快照）、无未解除故障影响，任一不满足 422 且**口令保持待确认**（可稍后重新确认）。成功后 `ready`；只读 / 封场演出 409 |
+
+> **请求编号幂等**：上表中所有 `/api/performances/:id/...` 的**写操作**（触发 / 跳过 / 撤回 / 复核申请与处置 / 预备口令发出与确认 / 故障登记与解除 / 成组提交 / 交接提交与签收 / 接续 / 封场）都接受可选的**请求编号**（body 字段 `request_id`，或 `Idempotency-Key` 请求头）：同一编号 + 相同操作与输入重送返回首次成功结果（附 `idempotent_replay: true` 标记），不重复产生业务记录；编号被不同操作或输入复用返回 409；校验失败不占号。未附编号时行为与返回字段完全不变。详见下文「请求编号幂等（现场断网重送）」。
 
 ## 撤回误触发（本轮新增）
 
@@ -891,6 +897,87 @@ curl http://localhost:3000/api/performances/1/closeout
 #   closing.report.final_results[].pace：{"classification":"on_time","classification_text":"准时","deviation_seconds":3,...}
 ```
 
+## 请求编号幂等（现场断网重送）（本轮新增）
+
+现场网络中断时，操作端无法确定一次写操作是否已到达服务器：直接重试可能重复触发、重复生成接续演出或封场报告。为此，同一演出的**每一次写操作都可附带一个请求编号**（idempotency key），服务端按编号去重，断网重送安全。
+
+**用法**
+
+- 请求体附带 `request_id` 字段（非空字符串，≤100 字符），或改用 `Idempotency-Key` 请求头（两者等效，body 字段优先）；
+- 编号由操作端生成，**同一演出内唯一**；建议每次发起新操作时生成一个（如 `r<时间戳>-<随机串>`），网络中断后**重送同一意图时沿用同一编号与相同输入**；
+- 覆盖的写操作（其余接口忽略编号、行为不变）：
+
+| 操作 | 接口 |
+| --- | --- |
+| 提示触发（含转为复核申请） | `POST /api/performances/:id/cues/:cueId/fire`、`POST .../review-requests` |
+| 跳过 / 撤回 | `POST .../cues/:cueId/skip`、`POST .../cues/:cueId/retract` |
+| 复核处置 | `POST .../review-requests/:reqId/confirm|cancel|reject` |
+| 预备口令 | `POST .../cues/:cueId/prep-commands`、`POST .../prep-commands/:cmdId/confirm` |
+| 故障处置 | `POST .../cues/:cueId/faults`、`POST .../faults/:faultId/resolve` |
+| 成组提交 | `POST .../batch`（预览为只读，不需要编号） |
+| 交接 | `POST .../handover`、`POST .../handover/sign` |
+| 接续 / 封场 | `POST .../continue`、`POST .../closeout` |
+
+**规则**
+
+- **同编号 + 相同操作与输入重送** → 返回**首次成功的业务结果**（HTTP 状态与字段原样返回，另附 `idempotent_replay: true` 与 `request_id` 标记），**不再产生**流水、复核申请、预备口令、故障记录、交接单、接续演出或封场报告；**即使演出随后已只读（已接续）或已封场，也同样返回首次结果**，不触发只读 / 封场拒绝；
+- **同编号被不同操作或输入复用**（换提示、换操作类型、改操作人 / 原因 / 清单等）→ **409 冲突**（`request_id_conflict: true`，附首次操作名与成功时间），**不改动任何数据**；新操作请更换编号；
+- **校验失败不占号**：400 / 404 / 409 / 422 等业务校验失败不写编号记录，**后续重试仍按最新现场状态判定**（如前置补齐后同编号重发可成功）；
+- **并发重送只提交一次**：编号记录与业务变更在同一 `BEGIN IMMEDIATE` 事务内提交（同成败），并由 `UNIQUE(performance_id, request_id)` 兜底；并发同编号请求中恰好一个真正执行，其余拿到首次结果；
+- **未附编号的调用行为与返回字段完全不变**（含既有重复触发 409 等规则）；编号记录随演出永久留存（供重放），演出删除时级联清理。
+
+**调用示例**（假设演出 id=1，提示 id=3）：
+
+```bash
+# 1) 触发时附带请求编号；网络中断后原样重送（同编号 + 同操作 + 同输入）
+curl -X POST http://localhost:3000/api/performances/1/cues/3/fire \
+  -H 'Content-Type: application/json' \
+  -d '{"operator":"张三","request_id":"show1-fire-L1-001"}'
+# → 200 {"event":{"id":7,"action":"fired","operator":"张三",...}}
+
+# 断网后重送同一请求（逐字节相同）→ 返回首次结果，不产生新流水
+curl -X POST http://localhost:3000/api/performances/1/cues/3/fire \
+  -H 'Content-Type: application/json' \
+  -d '{"operator":"张三","request_id":"show1-fire-L1-001"}'
+# → 200 {"event":{"id":7,...},"idempotent_replay":true,"request_id":"show1-fire-L1-001"}
+#    即使演出此刻已接续只读或已封场，仍返回该首次结果（不 409）
+
+# 2) 同一编号换了输入（操作人不同）→ 409 冲突，不改数据
+curl -X POST http://localhost:3000/api/performances/1/cues/3/fire \
+  -H 'Content-Type: application/json' \
+  -d '{"operator":"李四","request_id":"show1-fire-L1-001"}'
+# → 409 {"error":"请求编号「show1-fire-L1-001」在本演出已被「提示触发 / 登记复核申请」占用（首次成功时间 …），
+#        本次请求的操作或输入与其不一致，已拒绝且未改动任何数据；…",
+#        "request_id_conflict":true,"first_operation":"提示触发 / 登记复核申请","first_succeeded_at":"…"}
+
+# 3) 校验失败不占号：前置未满足 422 后，前置补齐再用同一编号重发可成功
+curl -X POST http://localhost:3000/api/performances/1/cues/5/fire \
+  -H 'Content-Type: application/json' -d '{"operator":"张三","request_id":"show1-fire-B1-001"}'
+# → 422 {"error":"前置提示未触发，无法触发：S1","unmet":["S1"]}   （编号未占用）
+# …触发 S1 后…
+curl -X POST http://localhost:3000/api/performances/1/cues/5/fire \
+  -H 'Content-Type: application/json' -d '{"operator":"张三","request_id":"show1-fire-B1-001"}'
+# → 200 {"event":{...}}   按最新现场状态判定通过
+
+# 4) 接续 / 封场等重操作同样去重：重送返回首次生成的接续演出 / 封场报告，不重复生成
+curl -X POST http://localhost:3000/api/performances/1/continue \
+  -H 'Content-Type: application/json' \
+  -d '{"version_id":3,"operator":"王监","request_id":"show1-continue-v3"}'
+# → 200 {"performance":{"id":7,...},...}；再次原样重送 → 200 同一演出 id=7 + idempotent_replay
+
+curl -X POST http://localhost:3000/api/performances/7/closeout \
+  -H 'Content-Type: application/json' \
+  -d '{"closed_by":"王监","note":"全场结束","request_id":"show1-closeout"}'
+# → 200 {"closing":{"id":1,...}}；封场后原样重送 → 200 同一份报告（不 409、不重复封场）
+
+# 5) 也可用请求头代替 body 字段
+curl -X POST http://localhost:3000/api/performances/1/cues/3/skip \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: show1-skip-S1-001' \
+  -d '{"operator":"张三","reason":"设备故障"}'
+```
+
+**执行台（前端）行为**：每次点击写操作自动生成请求编号随请求提交；若因网络中断未收到响应，**同一意图（同一操作目标 + 相同输入）再次提交时自动沿用首次编号**，服务端去重后返回首次结果（toast 提示「网络重送已去重」）；收到明确响应（成功或业务拒绝）或输入内容变化后，下一次点击生成新编号。操作端无需手工管理编号。
+
 ## 数据与并发说明
 
 - `cue_events` 为**流水表**：触发 / 跳过 / 撤回逐条追加，全量留痕；同一演出同一提示的「当前有效结果」由最新一条事件推导（`retracted` 表示已撤回、当前无有效结果），至多一个当前有效结果。`source` 区分 `manual`（现场操作）与 `carried`（接续时自来源演出承接，附 `carried_from_performance_id` / `carried_from_event_id`，沿用原操作人与时间，非再次触发）
@@ -901,9 +988,10 @@ curl http://localhost:3000/api/performances/1/closeout
 - `cue_handovers` 为**现场换班交接表**：提交（交班人、接班人、说明、固定快照 JSON、时间）、签收（`signed_at`）、重提替换（`superseded` + `superseded_at` + `superseded_by_handover_id`）全量留痕，状态机 `pending → signed`（签收终态、不可变）或 `pending → superseded`（原交班人重提 / 接续作废旧单）。部分唯一索引 `WHERE status='pending'` 保证**同一演出至多一张待签收单**；快照只在提交 / 重提时写入（含活动预备口令与未完成提示的预备阻塞原因），签收核对始终实时比对当前状态（差异含「预备口令」组）而不修改快照
 - `performances` 记录接续关系：`status`（`active` 可操作 / `readonly` 已接续只读 / `closed` 已封场结项终态）、`continued_from_performance_id`（来源演出）、`continued_at/by`（接续时间与操作人）；接续演出绑定目标版本，原演出仍绑定原版本快照
 - `performance_closings` 为**演出封场结项表**：每演出唯一一条（部分外键 + UNIQUE），记录结项人 `closed_by`、封场说明 `note`、结项时间 `closed_at` 与**不可变封场报告** `report`（固定 JSON：最终提示结果及原操作人 / 时间 / 流水 / 来源演出，承接结果沿接续链追溯到原流水 `origin/origin_hops`，另含复核申请、故障、交接单与完整流水快照）。封场在同一写事务内「核对阻项 → 写封场记录 → 置 `performances.status='closed'`」原子完成；封场后该演出一切写操作（单项 / 成组处置、复核、故障、交接、接续、重复封场）统一拒绝，原记录与报告仅可回看（GET 不受限）
+- `request_idempotency` 为**请求编号幂等表**：`UNIQUE(performance_id, request_id)` 保证同一演出内编号唯一；记录操作标识（路由模板 + 路径参数）、业务输入哈希（剔除编号后的请求体规范化 SHA-256）、首次成功的响应状态与响应体。写操作附编号时在同一 `BEGIN IMMEDIATE` 事务内「查号 → 重放 / 冲突 / 执行业务并记号」：命中且操作与输入一致直接返回存贮的首次结果（不再执行任何业务写入，优先于只读 / 封场判定）；命中但不一致 409；未命中才执行业务，成功才把编号与响应同事务落库（业务失败整体回滚、不占号）。未附编号的调用不读写本表
 - 触发、跳过、撤回、复核处置、成组提交、**故障登记 / 解除**、**预备口令发出 / 确认**、**交接提交 / 重提 / 签收**、**封场核对 / 执行**与**接续**均在 `BEGIN IMMEDIATE` 事务内「读最新事件 / 申请 / 故障 / 预备口令 / 交接单 / 演出状态 → 判定 → 写入」，并发操作串行判定，后到的冲突请求收到对应错误与当前状态（操作人、时间、原因、故障清单、预备口令状态、交接差异、接续演出位置、封场阻项清单）。交接单本身**不冻结任何现场操作**：交接期间触发 / 跳过 / 撤回 / 复核 / 成组 / 故障 / 预备照常，变化只在签收核对时体现为差异。未解除故障只冻结受影响提示的**触发**（含复核确认、预备确认），跳过与撤回按原有规则判定；**需预备提示的触发（含成组与复核确认）必须持有当前仍满足条件（前置流水 id 快照一致且无故障影响）的已就绪口令，任何写事务后就绪口令都会被重新扫描，失效即留痕且不自动恢复**；成组提交在事务内对整组清单**重新逐项判定**，任一项失败整体回滚（含同组已拟写入项），因此成组提交不可能只落一半流水；**封场在事务内对当前版本逐条复核提示结果与四类阻项，任一不满足整体回滚，演出保持可操作，不可能出现部分结项**；成组预览、封场核对为只读判定（Node 单线程同步读，不穿插写操作），不写任何数据
 - 前置是否满足、提示状态（待执行/已触发/已跳过/受阻）均按**当前有效结果**计算：前置被撤回后，未执行的下游提示重新变为受阻；复核确认时同样按当前有效结果判定，前置失效或存在故障则确认拒绝且申请保持待复核；接续后未执行提示一律按**新版依赖**重算（承接的已触发计入满足）
 - 接续前的按编号核对覆盖**整条接续链**（当前演出 + 逐级来源演出）：任一环节有触发 / 跳过 / 撤回流水、复核申请或承接结果的编号都须在新版保留其编号、类型、描述、前置集合与复核标记，且当前无待处理申请，否则整体拒绝并按编号返回原因
-- 旧版数据库启动时自动迁移：`cue_events` 唯一约束表重建为流水表、`cues` 补 `needs_review` 列（既有提示默认 0，按无需复核处理），`performances` 补 `status / continued_from_performance_id / continued_at / continued_by` 列（既有演出默认 `active`），`cue_events` 补 `source / carried_from_*` 列（既有流水默认 `manual`），并自动新建 `cue_faults` 故障登记表（含 active 部分唯一索引）与 `cue_handovers` 交接单表（含 pending 部分唯一索引）；再把 `performances.status` 的 CHECK 扩展为允许 `closed`（检测后重建表、保留全部列与记录）并新建 `performance_closings` 封场表；本轮再给 `cues` 补 `needs_prep` 列（既有提示默认 0，按无需预备处理）并新建 `cue_prep_commands` 预备口令表（含 `pending/ready` 活动口令部分唯一索引），以及给 `cues` 补 `planned_offset_seconds` / `tolerance_seconds` 计划节奏列（既有提示两列为 `NULL`，按未设置计划处理、不参与节奏统计），全部历史记录保留，无需手工操作
+- 旧版数据库启动时自动迁移：`cue_events` 唯一约束表重建为流水表、`cues` 补 `needs_review` 列（既有提示默认 0，按无需复核处理），`performances` 补 `status / continued_from_performance_id / continued_at / continued_by` 列（既有演出默认 `active`），`cue_events` 补 `source / carried_from_*` 列（既有流水默认 `manual`），并自动新建 `cue_faults` 故障登记表（含 active 部分唯一索引）与 `cue_handovers` 交接单表（含 pending 部分唯一索引）；再把 `performances.status` 的 CHECK 扩展为允许 `closed`（检测后重建表、保留全部列与记录）并新建 `performance_closings` 封场表；本轮再给 `cues` 补 `needs_prep` 列（既有提示默认 0，按无需预备处理）并新建 `cue_prep_commands` 预备口令表（含 `pending/ready` 活动口令部分唯一索引），以及给 `cues` 补 `planned_offset_seconds` / `tolerance_seconds` 计划节奏列（既有提示两列为 `NULL`，按未设置计划处理、不参与节奏统计），并新建 `request_idempotency` 请求编号幂等表（含 `UNIQUE(performance_id, request_id)`），全部历史记录保留，无需手工操作
 - 演出与版本通过外键绑定，版本发布后无更新入口（含 `needs_review` 标记），因此历史回看永远呈现演出当时的执行单内容；接续只新建演出并把原演出置为只读，**不改动任何版本快照**
 - 接续关系可在执行台顶部横幅与场次页演出记录中查看；只读演出仍可随时打开回看其流水、复核申请与当时版本

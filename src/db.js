@@ -16,6 +16,10 @@ const db = new DatabaseSync(DB_PATH);
 db.exec('PRAGMA journal_mode = WAL;');
 db.exec('PRAGMA foreign_keys = ON;');
 
+/** 事务嵌套深度：withTx 据此决定 BEGIN IMMEDIATE 还是 SAVEPOINT。
+ *  须在模块顶部声明——下方迁移函数在模块加载时即调用 withTx。 */
+let txDepth = 0;
+
 db.exec(`
 CREATE TABLE IF NOT EXISTS shows (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -209,6 +213,26 @@ CREATE TABLE IF NOT EXISTS performance_closings (
   closed_at      TEXT NOT NULL,
   report         TEXT NOT NULL
 );
+
+-- 请求编号幂等（现场网络中断重送去重）：操作端可为同一演出的一次写操作附带请求编号
+-- （request_id）。同一编号 + 相同操作与输入重送 → 返回首次成功的业务结果（response_body），
+-- 不再产生流水 / 接续演出 / 封场报告（即使演出随后已只读或封场也如此）；
+-- 同一编号被不同操作或输入复用 → 409 冲突且不改数据。
+-- 仅记录业务成功（2xx）的结果：校验失败（4xx）随事务回滚、不占号，重试按最新现场状态判定。
+-- 编号记录与业务变更在同一事务内提交（同成败）；UNIQUE(performance_id, request_id)
+-- 与 BEGIN IMMEDIATE 串行保证并发重送只能提交一次。未附编号的调用不写入本表，行为保持兼容。
+CREATE TABLE IF NOT EXISTS request_idempotency (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  performance_id  INTEGER NOT NULL REFERENCES performances(id) ON DELETE CASCADE,
+  request_id      TEXT NOT NULL,
+  operation       TEXT NOT NULL,
+  operation_text  TEXT NOT NULL DEFAULT '',
+  input_hash      TEXT NOT NULL,
+  response_status INTEGER NOT NULL,
+  response_body   TEXT NOT NULL,
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  UNIQUE (performance_id, request_id)
+);
 `);
 
 /**
@@ -373,9 +397,26 @@ function migrateCueEventsCarryIfNeeded() {
 
 migrateCueEventsCarryIfNeeded();
 
-/** 事务包装：BEGIN IMMEDIATE 保证写操作串行，冲突时整体回滚 */
+/** 事务包装：BEGIN IMMEDIATE 保证写操作串行，冲突时整体回滚。
+ *  支持嵌套：外层已持有事务时改用 SAVEPOINT —— 请求编号幂等包装器由此把
+ *  「编号记录」与业务写操作放进同一事务提交 / 回滚（同成败）。
+ *  本模块全部调用均为同步执行（node:sqlite 同步 API），深度计数不会交错。 */
 function withTx(fn) {
+  if (txDepth > 0) {
+    const sp = `cue_sp_${txDepth}`;
+    db.exec(`SAVEPOINT ${sp}`);
+    try {
+      const result = fn();
+      db.exec(`RELEASE ${sp}`);
+      return result;
+    } catch (err) {
+      try { db.exec(`ROLLBACK TO ${sp}`); } catch (_) { /* savepoint gone */ }
+      try { db.exec(`RELEASE ${sp}`); } catch (_) { /* savepoint gone */ }
+      throw err;
+    }
+  }
   db.exec('BEGIN IMMEDIATE');
+  txDepth += 1;
   try {
     const result = fn();
     db.exec('COMMIT');
@@ -383,6 +424,8 @@ function withTx(fn) {
   } catch (err) {
     try { db.exec('ROLLBACK'); } catch (_) { /* already rolled back */ }
     throw err;
+  } finally {
+    txDepth -= 1;
   }
 }
 

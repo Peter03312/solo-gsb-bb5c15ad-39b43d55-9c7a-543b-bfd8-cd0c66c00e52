@@ -7,13 +7,14 @@
  *   409 冲突（提示已有结果、版本已发布不可改、撤回时当前状态不允许或下游仍已触发、
  *       复核申请重复/已处置/处置人身份不符、待复核期间跳过或撤回、
  *       对只读（已接续）/已封场演出执行写操作或接续 / 封场、接续核对存在编号冲突、
- *       封场被阻项保持可操作、重复封场）
+ *       封场被阻项保持可操作、重复封场、请求编号被不同操作或输入复用）
  *   422 校验未通过（缺失引用/循环依赖）、前置未触发（受阻，含复核确认时前置失效）
  *       或受未解除设备故障影响（触发 / 复核确认被冻结，附 blocked_by_faults，申请保持待复核）；
  *       需预备提示在未发口令 / 口令待确认 / 就绪已失效（前置流水变化或故障）时触发、成组触发
  *       或双人复核确认同样 422（附 needs_prep / prep_status，不改任何数据）；
  *       封场前核对存在阻项（未完成提示 / 待复核申请 / 未解除故障 / 待签收交接单）
  */
+const crypto = require('node:crypto');
 const { db, withTx } = require('./db');
 const { validateCues, CUE_TYPES, isNonNegativeInt } = require('./validate');
 
@@ -582,7 +583,135 @@ function route(method, pattern, handler) {
   const rx = new RegExp(
     '^' + pattern.replace(/:[^/]+/g, (m) => { keys.push(m.slice(1)); return '([^/]+)'; }) + '$'
   );
-  routes.push({ method, rx, keys, handler });
+  routes.push({ method, pattern, rx, keys, handler });
+}
+
+/* ---- 请求编号幂等（现场网络中断重送去重） ----
+ * 操作端可为同一演出的一次写操作附带请求编号（body.request_id，或 Idempotency-Key 请求头）：
+ *  - 同一编号 + 相同操作与输入重送 → 返回首次成功的业务结果（附 idempotent_replay 标记），
+ *    不再产生流水 / 接续演出 / 封场报告；即使演出随后已只读或封场也同样返回首次结果；
+ *  - 同一编号被不同操作或输入复用 → 409 冲突，不改任何数据；
+ *  - 校验失败（4xx）不占号：编号记录只在业务成功时与业务变更同事务写入（同成败），
+ *    后续重试仍按最新现场状态判定；
+ *  - 并发重送由 BEGIN IMMEDIATE 串行 + UNIQUE(performance_id, request_id) 保证只提交一次；
+ *  - 未附编号的调用不进入本逻辑，行为与返回字段保持兼容。
+ * 覆盖的写操作（method + 路由模板 → 中文操作名）： */
+const IDEMPOTENT_OPERATIONS = {
+  'POST /api/performances/:id/cues/:cueId/fire': '提示触发 / 登记复核申请',
+  'POST /api/performances/:id/cues/:cueId/skip': '提示跳过',
+  'POST /api/performances/:id/cues/:cueId/retract': '撤回触发',
+  'POST /api/performances/:id/cues/:cueId/review-requests': '登记复核申请',
+  'POST /api/performances/:id/review-requests/:reqId/confirm': '复核确认',
+  'POST /api/performances/:id/review-requests/:reqId/cancel': '复核撤销',
+  'POST /api/performances/:id/review-requests/:reqId/reject': '复核驳回',
+  'POST /api/performances/:id/cues/:cueId/prep-commands': '发出预备口令',
+  'POST /api/performances/:id/prep-commands/:cmdId/confirm': '确认预备口令',
+  'POST /api/performances/:id/cues/:cueId/faults': '登记故障',
+  'POST /api/performances/:id/faults/:faultId/resolve': '解除故障',
+  'POST /api/performances/:id/batch': '成组连续处置提交',
+  'POST /api/performances/:id/handover': '提交 / 重提交接单',
+  'POST /api/performances/:id/handover/sign': '签收交接单',
+  'POST /api/performances/:id/continue': '生成接续演出',
+  'POST /api/performances/:id/closeout': '演出封场',
+};
+
+/** 规范化 JSON 序列化（对象键排序、跳过 undefined）：操作标识与输入哈希的稳定计算 */
+function canonicalize(value) {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value === undefined ? null : value);
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalize).join(',')}]`;
+  const keys = Object.keys(value).filter((k) => value[k] !== undefined).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalize(value[k])}`).join(',')}}`;
+}
+
+/** 提取请求编号：body.request_id 优先，兼容 Idempotency-Key 请求头；未附返回 null。
+ *  附了但为空串 / 超长 → 400（属校验失败，同样不占号）。 */
+function extractRequestId(body, req) {
+  let raw = body && body.request_id != null ? body.request_id : null;
+  if (raw == null && req && req.headers && req.headers['idempotency-key'] != null) {
+    raw = req.headers['idempotency-key'];
+  }
+  if (raw == null) return null;
+  const s = String(raw).trim();
+  if (!s) throw new HttpError(400, '请求编号（request_id）不能为空');
+  if (s.length > 100) throw new HttpError(400, '请求编号（request_id）过长（上限 100 字符）');
+  return s;
+}
+
+/** 业务输入哈希：剔除请求编号本身后的全部请求体字段（重送须携带相同输入） */
+function idemInputHash(body) {
+  const inputs = {};
+  for (const k of Object.keys(body || {})) {
+    if (k === 'request_id' || body[k] === undefined) continue;
+    inputs[k] = body[k];
+  }
+  return crypto.createHash('sha256').update(canonicalize(inputs)).digest('hex');
+}
+
+/**
+ * 幂等执行一次演出写操作（路由分发识别到请求编号时调用）：
+ * 同一事务内「查号 → 重放 / 冲突 / 执行业务并记号」：
+ *  - 已记录且操作与输入一致 → 直接返回首次成功的业务结果（不产生任何新业务记录，
+ *    也不触发只读 / 封场拒绝——重放优先于演出状态判定）；
+ *  - 已记录但操作或输入不一致 → 409 冲突，不改任何数据；
+ *  - 未记录 → 执行业务（其内部 withTx 变为 SAVEPOINT），成功才把编号与响应同事务落库；
+ *    业务校验失败（HttpError）随事务整体回滚：不占号，重试按最新现场状态重新判定。
+ */
+function runIdempotent(routeDef, params, requestId, body, req) {
+  const performanceId = Number(params.id);
+  if (!Number.isInteger(performanceId)) throw new HttpError(404, '演出不存在');
+  const routeKey = `${routeDef.method} ${routeDef.pattern}`;
+  const operation = `${routeKey} ${canonicalize(params)}`;
+  const operationText = IDEMPOTENT_OPERATIONS[routeKey] || routeKey;
+  const inputHash = idemInputHash(body);
+
+  return withTx(() => {
+    const existing = db.prepare(
+      'SELECT * FROM request_idempotency WHERE performance_id = ? AND request_id = ?'
+    ).get(performanceId, requestId);
+
+    if (existing) {
+      if (existing.operation === operation && existing.input_hash === inputHash) {
+        return {
+          status: existing.response_status,
+          data: {
+            ...JSON.parse(existing.response_body),
+            idempotent_replay: true,
+            request_id: requestId,
+          },
+        };
+      }
+      throw new HttpError(
+        409,
+        `请求编号「${requestId}」在本演出已被「${existing.operation_text}」占用` +
+        `（首次成功时间 ${existing.created_at}），本次请求的操作或输入与其不一致，已拒绝且未改动任何数据；` +
+        '同一请求编号只能用于同一操作与相同输入的重送，新操作请更换请求编号',
+        {
+          request_id_conflict: true,
+          request_id: requestId,
+          first_operation: existing.operation_text,
+          first_succeeded_at: existing.created_at,
+        }
+      );
+    }
+
+    const perf = db.prepare('SELECT id FROM performances WHERE id = ?').get(performanceId);
+    if (!perf) throw new HttpError(404, '演出不存在');
+
+    const result = routeDef.handler(body, params, req);
+    if (result && typeof result.then === 'function') {
+      throw new Error('幂等路由的处理器必须为同步函数（事务内不能跨异步边界）');
+    }
+
+    db.prepare(`
+      INSERT INTO request_idempotency
+        (performance_id, request_id, operation, operation_text, input_hash, response_status, response_body)
+      VALUES (?,?,?,?,?,?,?)
+    `).run(performanceId, requestId, operation, operationText, inputHash, 200, JSON.stringify(result));
+
+    return { status: 200, data: result };
+  });
 }
 
 /* ---- 场次 ---- */
@@ -3326,6 +3455,12 @@ async function handle(req, res, url, body) {
     if (!m) continue;
     const params = {};
     r.keys.forEach((k, i) => { params[k] = decodeURIComponent(m[i + 1]); });
+    // 演出写操作支持请求编号幂等：附了编号走去重逻辑（查号→重放/冲突/执行并记号）；
+    // 未附编号的调用保持原有行为与返回字段不变
+    if (IDEMPOTENT_OPERATIONS[`${r.method} ${r.pattern}`]) {
+      const requestId = extractRequestId(body, req);
+      if (requestId) return runIdempotent(r, params, requestId, body, req);
+    }
     const result = await r.handler(body, params, req);
     return { status: 200, data: result };
   }
