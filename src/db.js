@@ -16,6 +16,10 @@ const db = new DatabaseSync(DB_PATH);
 db.exec('PRAGMA journal_mode = WAL;');
 db.exec('PRAGMA foreign_keys = ON;');
 
+/* 事务嵌套层级：>0 时 withTx 并入外层事务（见下方 withTx）。
+ * 须在任何迁移 / 建表调用之前初始化（迁移在模块加载期即调用 withTx）。 */
+let txDepth = 0;
+
 db.exec(`
 CREATE TABLE IF NOT EXISTS shows (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -209,6 +213,28 @@ CREATE TABLE IF NOT EXISTS performance_closings (
   closed_at      TEXT NOT NULL,
   report         TEXT NOT NULL
 );
+
+-- 请求编号（幂等重发）：现场网络中断后，操作端可对同一演出的一次写操作附带请求编号
+-- （request_key，请求体字段或 Idempotency-Key 请求头）。同一演出内编号唯一：
+--   · 相同编号 + 相同操作与输入的重送直接返回首次成功的业务结果（response 原样回放），
+--     不再产生流水 / 复核申请 / 预备口令 / 故障记录 / 交接单 / 接续演出 / 封场报告，
+--     即使原演出随后已只读或已封场也如此；
+--   · 编号被不同操作或不同输入复用 → 409 冲突且不改任何数据；
+--   · 仅在业务成功时才写入本表（校验失败不占号，后续重试按最新现场状态判定）；
+--   · 编号记录与业务变更在同一 BEGIN IMMEDIATE 事务内写入（同成败）；
+--   UNIQUE(performance_id, request_key) 保证并发重送只能提交一次。
+CREATE TABLE IF NOT EXISTS performance_request_keys (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  performance_id INTEGER NOT NULL REFERENCES performances(id) ON DELETE CASCADE,
+  request_key    TEXT NOT NULL,
+  operation      TEXT NOT NULL,
+  input_fingerprint TEXT NOT NULL,
+  input_json     TEXT NOT NULL,
+  response       TEXT NOT NULL,
+  operator       TEXT NOT NULL DEFAULT '',
+  created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  UNIQUE (performance_id, request_key)
+);
 `);
 
 /**
@@ -373,9 +399,16 @@ function migrateCueEventsCarryIfNeeded() {
 
 migrateCueEventsCarryIfNeeded();
 
-/** 事务包装：BEGIN IMMEDIATE 保证写操作串行，冲突时整体回滚 */
+/**
+ * 事务包装：BEGIN IMMEDIATE 保证写操作串行，冲突时整体回滚。
+ * 支持嵌套：外层已持有事务时直接并入同一事务（同成败、同回滚）——
+ * 请求编号（幂等重发）需要把"编号记录"与业务函数内部的事务合并在同一事务内写入。
+ * Node 单线程且 node:sqlite 为同步调用，事务回调均为同步代码，不会交叉执行。
+ */
 function withTx(fn) {
+  if (txDepth > 0) return fn();
   db.exec('BEGIN IMMEDIATE');
+  txDepth += 1;
   try {
     const result = fn();
     db.exec('COMMIT');
@@ -383,6 +416,8 @@ function withTx(fn) {
   } catch (err) {
     try { db.exec('ROLLBACK'); } catch (_) { /* already rolled back */ }
     throw err;
+  } finally {
+    txDepth -= 1;
   }
 }
 

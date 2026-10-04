@@ -25,6 +25,148 @@ class HttpError extends Error {
   }
 }
 
+/* ---- 请求编号（幂等重发）：现场断网后同一写操作的安全重送 ----
+ *
+ * 操作端可对同一演出的一次写操作附带请求编号（请求体 request_key 字段，
+ * 或 Idempotency-Key / X-Request-Key 请求头）。规则：
+ *  - 同一演出内编号唯一：相同编号 + 相同操作与输入的重送，直接返回首次成功的
+ *    业务结果（原样回放），不再产生流水 / 申请 / 口令 / 故障 / 交接单 / 接续演出 / 封场报告；
+ *    即使原演出随后已只读（已接续）或已封场，也仍返回首次结果；
+ *  - 同一演出内编号被不同操作或不同输入复用 → 409 冲突，不改任何数据；
+ *  - 校验失败（400/409/422 等任何未成功）不占号：不写入编号记录，
+ *    后续重试仍按最新现场状态判定；
+ *  - 编号记录与业务变更在同一 BEGIN IMMEDIATE 事务内写入（同成败），
+ *    UNIQUE(performance_id, request_key) 保证并发重送只能提交一次；
+ *  - 未附编号的调用行为与返回字段保持兼容（不新增任何字段）。
+ */
+
+const REQUEST_KEY_MAX_LEN = 100;
+
+// 操作标识 → 中文说明（冲突提示与记录展示用）
+const REQUEST_KEY_OP_TEXT = {
+  'cue.fire': '触发提示',
+  'cue.skip': '跳过提示',
+  'cue.retract': '撤回触发',
+  'review.create': '登记复核申请',
+  'review.confirm': '复核确认',
+  'review.cancel': '复核撤销',
+  'review.reject': '复核驳回',
+  'prep.issue': '发出预备口令',
+  'prep.confirm': '确认预备口令',
+  'fault.register': '登记设备故障',
+  'fault.resolve': '解除设备故障',
+  'batch.submit': '成组连续处置',
+  'handover.submit': '提交交接单',
+  'handover.sign': '签收交接单',
+  'performance.continue': '接续演出',
+  'performance.closeout': '演出封场',
+};
+
+/** 规范化 JSON（对象键排序、数组保序）：作为"相同输入"的指纹 */
+function canonicalJson(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  const keys = Object.keys(value).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(value[k])}`).join(',')}}`;
+}
+
+/**
+ * 解析请求编号：请求体 request_key（兼容 idempotency_key）优先，
+ * 其次 Idempotency-Key / X-Request-Key 请求头。空串视为未附编号（保持兼容）；
+ * 过长直接 400（不执行任何业务、不占号）。
+ */
+function parseRequestKey(body, req) {
+  let raw = null;
+  if (body && body.request_key != null) raw = body.request_key;
+  else if (body && body.idempotency_key != null) raw = body.idempotency_key;
+  else if (req && req.headers) {
+    raw = req.headers['idempotency-key'] || req.headers['x-request-key'] || null;
+  }
+  if (raw == null) return null;
+  const key = String(raw).trim();
+  if (!key) return null;
+  if (key.length > REQUEST_KEY_MAX_LEN) {
+    throw new HttpError(400, `请求编号过长（上限 ${REQUEST_KEY_MAX_LEN} 字符）`);
+  }
+  return key;
+}
+
+/**
+ * 以请求编号执行一次写操作（编号记录与业务变更同一事务、同成败）：
+ *  - 未附编号：直接执行，行为与既有调用完全一致；
+ *  - 编号已存在且操作与输入相同：返回首次成功的业务结果（附 idempotency.replayed），
+ *    不再执行任何业务判定与写入（即使演出已只读 / 已封场也如此）；
+ *  - 编号已存在但操作或输入不同：409 冲突，不改任何数据；
+ *  - 编号不存在：在同一 BEGIN IMMEDIATE 事务内执行业务，成功后写入编号记录；
+ *    业务失败（任何校验 / 冲突 / 状态错误）整体回滚，不占号。
+ * @param {number} performanceId 演出 id（编号按演出隔离）
+ * @param {string} operation 操作标识（REQUEST_KEY_OP_TEXT 的键）
+ * @param {object} input 规范化后的业务输入（与业务实际使用的值一致）
+ * @param {string|null} requestKey 请求编号（null 表示未附编号）
+ * @param {Function} executor 业务执行函数（可含自身的 withTx，将并入本事务）
+ */
+function withRequestKey(performanceId, operation, input, requestKey, executor) {
+  if (!requestKey) return executor();
+  const fingerprint = canonicalJson(input);
+  return withTx(() => {
+    const existing = db.prepare(
+      'SELECT * FROM performance_request_keys WHERE performance_id = ? AND request_key = ?'
+    ).get(performanceId, requestKey);
+    if (existing) {
+      if (existing.operation === operation && existing.input_fingerprint === fingerprint) {
+        // 同一次操作的重复提交：原样回放首次成功的业务结果，不产生任何新记录
+        const stored = JSON.parse(existing.response);
+        return {
+          ...stored,
+          idempotency: {
+            request_key: requestKey,
+            replayed: true,
+            first_executed_at: existing.created_at,
+          },
+        };
+      }
+      const first = {
+        operation: existing.operation,
+        operation_text: REQUEST_KEY_OP_TEXT[existing.operation] || existing.operation,
+        input: JSON.parse(existing.input_json),
+        operator: existing.operator || null,
+        created_at: existing.created_at,
+      };
+      throw new HttpError(
+        409,
+        `请求编号「${requestKey}」已被「${first.operation_text}」占用` +
+        `（${existing.operator ? `操作人 ${existing.operator}，` : ''}时间 ${existing.created_at}）：` +
+        `同一编号只能用于同一次写操作的重复提交，本次「${REQUEST_KEY_OP_TEXT[operation] || operation}」` +
+        `的操作或输入与之不一致，未执行任何变更`,
+        {
+          request_key: requestKey,
+          request_key_conflict: true,
+          first,
+          current: {
+            operation,
+            operation_text: REQUEST_KEY_OP_TEXT[operation] || operation,
+            input,
+          },
+        }
+      );
+    }
+    // 首次执行：业务判定与写入 + 编号记录在同一事务内提交；业务抛错则整体回滚（不占号）
+    const result = executor();
+    const operator = input && typeof input === 'object'
+      ? (input.operator || input.issued_by || input.closed_by || input.handed_by || '')
+      : '';
+    db.prepare(`
+      INSERT INTO performance_request_keys
+        (performance_id, request_key, operation, input_fingerprint, input_json, response, operator)
+      VALUES (?,?,?,?,?,?,?)
+    `).run(performanceId, requestKey, operation, fingerprint, JSON.stringify(input), JSON.stringify(result), operator);
+    return {
+      ...result,
+      idempotency: { request_key: requestKey, replayed: false },
+    };
+  });
+}
+
 /* ---------------- 工具 ---------------- */
 
 const ACTION_TEXT = { fired: '已触发', skipped: '已跳过', retracted: '已撤回' };
@@ -1327,79 +1469,113 @@ function rejectReviewRequest(performanceId, requestId, operator, reason) {
   });
 }
 
-route('POST', '/api/performances/:id/cues/:cueId/fire', (body, p) => {
+route('POST', '/api/performances/:id/cues/:cueId/fire', (body, p, req) => {
   const operator = String(body.operator || '').trim().slice(0, 50);
   if (!operator) throw new HttpError(400, '请填写操作人');
   const perfId = Number(p.id);
   const cueId = Number(p.cueId);
+  const requestKey = parseRequestKey(body, req);
   // 需双人复核的提示：触发接口转为登记复核申请，不能绕过复核直接写入触发流水；
   // 普通提示保持原有行为与响应（{ event }）
-  const { cue } = getPerfCue(perfId, cueId);
-  if (cue.needs_review) return createReviewRequest(perfId, cueId, operator);
-  return recordEvent(perfId, cueId, 'fired', operator, null);
+  return withRequestKey(perfId, 'cue.fire', { cue_id: cueId, operator }, requestKey, () => {
+    const { cue } = getPerfCue(perfId, cueId);
+    if (cue.needs_review) return createReviewRequest(perfId, cueId, operator);
+    return recordEvent(perfId, cueId, 'fired', operator, null);
+  });
 });
 
-route('POST', '/api/performances/:id/cues/:cueId/review-requests', (body, p) => {
+route('POST', '/api/performances/:id/cues/:cueId/review-requests', (body, p, req) => {
   const operator = String(body.operator || '').trim().slice(0, 50);
   if (!operator) throw new HttpError(400, '请填写操作人');
   const perfId = Number(p.id);
   const cueId = Number(p.cueId);
-  const { cue } = getPerfCue(perfId, cueId);
-  if (!cue.needs_review) {
-    throw new HttpError(400, `提示「${cue.label}」未标记需双人复核，可直接触发`);
-  }
-  return createReviewRequest(perfId, cueId, operator);
+  const requestKey = parseRequestKey(body, req);
+  return withRequestKey(perfId, 'review.create', { cue_id: cueId, operator }, requestKey, () => {
+    const { cue } = getPerfCue(perfId, cueId);
+    if (!cue.needs_review) {
+      throw new HttpError(400, `提示「${cue.label}」未标记需双人复核，可直接触发`);
+    }
+    return createReviewRequest(perfId, cueId, operator);
+  });
 });
 
-route('POST', '/api/performances/:id/review-requests/:reqId/confirm', (body, p) => {
+route('POST', '/api/performances/:id/review-requests/:reqId/confirm', (body, p, req) => {
   const operator = String(body.operator || '').trim().slice(0, 50);
   if (!operator) throw new HttpError(400, '请填写操作人');
-  return confirmReviewRequest(Number(p.id), Number(p.reqId), operator);
+  const perfId = Number(p.id);
+  const reqId = Number(p.reqId);
+  const requestKey = parseRequestKey(body, req);
+  return withRequestKey(perfId, 'review.confirm', { request_id: reqId, operator }, requestKey,
+    () => confirmReviewRequest(perfId, reqId, operator));
 });
 
-route('POST', '/api/performances/:id/review-requests/:reqId/cancel', (body, p) => {
+route('POST', '/api/performances/:id/review-requests/:reqId/cancel', (body, p, req) => {
   const operator = String(body.operator || '').trim().slice(0, 50);
   if (!operator) throw new HttpError(400, '请填写操作人');
-  return cancelReviewRequest(Number(p.id), Number(p.reqId), operator);
+  const perfId = Number(p.id);
+  const reqId = Number(p.reqId);
+  const requestKey = parseRequestKey(body, req);
+  return withRequestKey(perfId, 'review.cancel', { request_id: reqId, operator }, requestKey,
+    () => cancelReviewRequest(perfId, reqId, operator));
 });
 
-route('POST', '/api/performances/:id/review-requests/:reqId/reject', (body, p) => {
+route('POST', '/api/performances/:id/review-requests/:reqId/reject', (body, p, req) => {
   const operator = String(body.operator || '').trim().slice(0, 50);
   if (!operator) throw new HttpError(400, '请填写操作人');
   const reason = String(body.reason || '').trim().slice(0, 200);
   if (!reason) throw new HttpError(400, '驳回必须填写原因');
-  return rejectReviewRequest(Number(p.id), Number(p.reqId), operator, reason);
+  const perfId = Number(p.id);
+  const reqId = Number(p.reqId);
+  const requestKey = parseRequestKey(body, req);
+  return withRequestKey(perfId, 'review.reject', { request_id: reqId, operator, reason }, requestKey,
+    () => rejectReviewRequest(perfId, reqId, operator, reason));
 });
 
 /* ---- 预备口令（需预备提示：发出 → 另一操作人确认就绪 → 才可触发） ---- */
 
-route('POST', '/api/performances/:id/cues/:cueId/prep-commands', (body, p) => {
+route('POST', '/api/performances/:id/cues/:cueId/prep-commands', (body, p, req) => {
   // 兼容 issued_by（舞台监督发令人）与 operator 两种字段
   const issuedBy = String(body.issued_by || body.operator || '').trim().slice(0, 50);
   if (!issuedBy) throw new HttpError(400, '请填写发令的舞台监督姓名');
-  return issuePrepCommand(Number(p.id), Number(p.cueId), issuedBy);
+  const perfId = Number(p.id);
+  const cueId = Number(p.cueId);
+  const requestKey = parseRequestKey(body, req);
+  return withRequestKey(perfId, 'prep.issue', { cue_id: cueId, issued_by: issuedBy }, requestKey,
+    () => issuePrepCommand(perfId, cueId, issuedBy));
 });
 
-route('POST', '/api/performances/:id/prep-commands/:cmdId/confirm', (body, p) => {
+route('POST', '/api/performances/:id/prep-commands/:cmdId/confirm', (body, p, req) => {
   const operator = String(body.operator || body.confirmed_by || '').trim().slice(0, 50);
   if (!operator) throw new HttpError(400, '请填写确认操作人');
-  return confirmPrepCommand(Number(p.id), Number(p.cmdId), operator);
+  const perfId = Number(p.id);
+  const cmdId = Number(p.cmdId);
+  const requestKey = parseRequestKey(body, req);
+  return withRequestKey(perfId, 'prep.confirm', { command_id: cmdId, operator }, requestKey,
+    () => confirmPrepCommand(perfId, cmdId, operator));
 });
 
-route('POST', '/api/performances/:id/cues/:cueId/skip', (body, p) => {
+route('POST', '/api/performances/:id/cues/:cueId/skip', (body, p, req) => {
   const operator = String(body.operator || '').trim().slice(0, 50);
   if (!operator) throw new HttpError(400, '请填写操作人');
   const reason = String(body.reason || '').trim().slice(0, 200);
   if (!reason) throw new HttpError(400, '跳过必须填写原因');
-  return recordEvent(Number(p.id), Number(p.cueId), 'skipped', operator, reason);
+  const perfId = Number(p.id);
+  const cueId = Number(p.cueId);
+  const requestKey = parseRequestKey(body, req);
+  return withRequestKey(perfId, 'cue.skip', { cue_id: cueId, operator, reason }, requestKey,
+    () => recordEvent(perfId, cueId, 'skipped', operator, reason));
 });
 
-route('POST', '/api/performances/:id/cues/:cueId/retract', (body, p) => {
+route('POST', '/api/performances/:id/cues/:cueId/retract', (body, p, req) => {
   const operator = String(body.operator || '').trim().slice(0, 50);
   if (!operator) throw new HttpError(400, '请填写操作人');
   const reason = String(body.reason || '').trim().slice(0, 200);
   if (!reason) throw new HttpError(400, '撤回必须填写原因');
-  return retractEvent(Number(p.id), Number(p.cueId), operator, reason);
+  const perfId = Number(p.id);
+  const cueId = Number(p.cueId);
+  const requestKey = parseRequestKey(body, req);
+  return withRequestKey(perfId, 'cue.retract', { cue_id: cueId, operator, reason }, requestKey,
+    () => retractEvent(perfId, cueId, operator, reason));
 });
 
 /* ---- 现场设备故障：登记 / 解除（与现场操作、接续同一 BEGIN IMMEDIATE 串行判定） ---- */
@@ -1491,20 +1667,28 @@ function resolveFault(performanceId, faultId, operator, reason) {
   });
 }
 
-route('POST', '/api/performances/:id/cues/:cueId/faults', (body, p) => {
+route('POST', '/api/performances/:id/cues/:cueId/faults', (body, p, req) => {
   const operator = String(body.operator || '').trim().slice(0, 50);
   if (!operator) throw new HttpError(400, '请填写操作人');
   const reason = String(body.reason || '').trim().slice(0, 200);
   if (!reason) throw new HttpError(400, '登记故障必须填写原因');
-  return registerFault(Number(p.id), Number(p.cueId), operator, reason);
+  const perfId = Number(p.id);
+  const cueId = Number(p.cueId);
+  const requestKey = parseRequestKey(body, req);
+  return withRequestKey(perfId, 'fault.register', { cue_id: cueId, operator, reason }, requestKey,
+    () => registerFault(perfId, cueId, operator, reason));
 });
 
-route('POST', '/api/performances/:id/faults/:faultId/resolve', (body, p) => {
+route('POST', '/api/performances/:id/faults/:faultId/resolve', (body, p, req) => {
   const operator = String(body.operator || '').trim().slice(0, 50);
   if (!operator) throw new HttpError(400, '请填写操作人');
   const reason = String(body.reason || '').trim().slice(0, 200);
   if (!reason) throw new HttpError(400, '解除故障必须填写原因');
-  return resolveFault(Number(p.id), Number(p.faultId), operator, reason);
+  const perfId = Number(p.id);
+  const faultId = Number(p.faultId);
+  const requestKey = parseRequestKey(body, req);
+  return withRequestKey(perfId, 'fault.resolve', { fault_id: faultId, operator, reason }, requestKey,
+    () => resolveFault(perfId, faultId, operator, reason));
 });
 
 /* ---- 修订执行单接续（核对 + 执行；与现场操作同一 BEGIN IMMEDIATE 串行判定） ---- */
@@ -1872,20 +2056,29 @@ function continuePerformance(perf, target, operator, name) {
   });
 }
 
-route('POST', '/api/performances/:id/continue', (body, p) => {
+route('POST', '/api/performances/:id/continue', (body, p, req) => {
   const operator = String(body.operator || '').trim().slice(0, 50);
   if (!operator) throw new HttpError(400, '请填写操作人');
-  const perf = db.prepare('SELECT * FROM performances WHERE id = ?').get(p.id);
-  if (!perf) throw new HttpError(404, '演出不存在');
-  if (perf.status === 'closed') {
-    throw new HttpError(409, '该演出已封场结项，不能重复接续；封场报告可回看', { readonly: true, closed: true });
-  }
-  if (perf.status === 'readonly') {
-    throw new HttpError(409, '该演出已接续并转为只读，不能重复接续；请从当前可操作（接续）演出发起', { readonly: true });
-  }
-  const target = resolveContinueTarget(perf, body.version_id);
+  const perfId = Number(p.id);
   const name = String(body.name || '').trim().slice(0, 100);
-  return continuePerformance(perf, target, operator, name);
+  // 输入指纹使用规范化后的业务输入（version_id 以数值参与；非法值原样保留，业务校验会拒绝且不占号）
+  const versionIdNum = Number(body.version_id);
+  const versionIdInput = Number.isInteger(versionIdNum)
+    ? versionIdNum
+    : (body.version_id == null ? null : String(body.version_id).slice(0, 50));
+  const requestKey = parseRequestKey(body, req);
+  return withRequestKey(perfId, 'performance.continue', { version_id: versionIdInput, name, operator }, requestKey, () => {
+    const perf = db.prepare('SELECT * FROM performances WHERE id = ?').get(perfId);
+    if (!perf) throw new HttpError(404, '演出不存在');
+    if (perf.status === 'closed') {
+      throw new HttpError(409, '该演出已封场结项，不能重复接续；封场报告可回看', { readonly: true, closed: true });
+    }
+    if (perf.status === 'readonly') {
+      throw new HttpError(409, '该演出已接续并转为只读，不能重复接续；请从当前可操作（接续）演出发起', { readonly: true });
+    }
+    const target = resolveContinueTarget(perf, body.version_id);
+    return continuePerformance(perf, target, operator, name);
+  });
 });
 
 /* ---- 现场换班交接（提交 / 重提替换 / 签收核对；与现场操作、复核、故障、接续同一 BEGIN IMMEDIATE 串行判定） ---- */
@@ -2427,16 +2620,22 @@ function flattenDiffs(groups) {
   return diffs;
 }
 
-route('POST', '/api/performances/:id/handover', (body, p) => {
+route('POST', '/api/performances/:id/handover', (body, p, req) => {
   const { handedBy, receivedBy } = parseHandoverPeople(body);
   const note = String(body.note != null ? body.note : '').trim().slice(0, 500);
-  return submitHandover(Number(p.id), handedBy, receivedBy, note);
+  const perfId = Number(p.id);
+  const requestKey = parseRequestKey(body, req);
+  return withRequestKey(perfId, 'handover.submit', { handed_by: handedBy, received_by: receivedBy, note }, requestKey,
+    () => submitHandover(perfId, handedBy, receivedBy, note));
 });
 
-route('POST', '/api/performances/:id/handover/sign', (body, p) => {
+route('POST', '/api/performances/:id/handover/sign', (body, p, req) => {
   const operator = String(body.operator || '').trim().slice(0, 50);
   if (!operator) throw new HttpError(400, '请填写签收人');
-  return signHandover(Number(p.id), operator);
+  const perfId = Number(p.id);
+  const requestKey = parseRequestKey(body, req);
+  return withRequestKey(perfId, 'handover.sign', { operator }, requestKey,
+    () => signHandover(perfId, operator));
 });
 
 /** 签收前只读核对（不改数据）：返回待签收单与当前差异，便于执行台展示 / 调用方预检查 */
@@ -2864,10 +3063,11 @@ route('POST', '/api/performances/:id/batch/preview', (body, p) => {
   };
 });
 
-route('POST', '/api/performances/:id/batch', (body, p) => {
+route('POST', '/api/performances/:id/batch', (body, p, req) => {
   const { operator, items } = parseGroupBody(body);
   const perfId = Number(p.id);
-  return withTx(() => {
+  const requestKey = parseRequestKey(body, req);
+  return withRequestKey(perfId, 'batch.submit', { operator, items }, requestKey, () => withTx(() => {
     // 提交瞬间在 BEGIN IMMEDIATE 内重读最新状态并重新逐项判定：
     // 与单项操作、接续串行，排队期间的任何现场变化都会纳入判定，不信任此前预览结果
     const fresh = db.prepare('SELECT * FROM performances WHERE id = ?').get(perfId);
@@ -2906,7 +3106,7 @@ route('POST', '/api/performances/:id/batch', (body, p) => {
       // 提交事务内按最新数据库状态再扫一遍就绪口令（与单项 / 故障 / 接续串行的最终防线）
       invalidated_prep: sweepPrepReadiness(fresh.id, fresh.version_id),
     };
-  });
+  }));
 });
 
 /* ---- 演出封场结项（封场前核对 + 一次性固定不可变报告；与全部现场写操作同一 BEGIN IMMEDIATE 串行判定） ---- */
@@ -3299,13 +3499,15 @@ route('POST', '/api/performances/:id/closeout/check', (body, p) => {
   });
 });
 
-route('POST', '/api/performances/:id/closeout', (body, p) => {
+route('POST', '/api/performances/:id/closeout', (body, p, req) => {
   const perfId = Number(p.id);
   const closedBy = String(body.closed_by || body.operator || '').trim().slice(0, 50);
   if (!closedBy) throw new HttpError(400, '请填写结项人');
   const note = String(body.note || '').trim().slice(0, 500);
   if (!note) throw new HttpError(400, '请填写封场说明');
-  return closePerformance(perfId, closedBy, note);
+  const requestKey = parseRequestKey(body, req);
+  return withRequestKey(perfId, 'performance.closeout', { closed_by: closedBy, note }, requestKey,
+    () => closePerformance(perfId, closedBy, note));
 });
 
 route('GET', '/api/performances/:id/closeout', (body, p) => {
